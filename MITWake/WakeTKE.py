@@ -1,10 +1,8 @@
 """
-Curled Wake model testing for one turbine in isolation. 
+Forward marching wake TKE.
 
-#TODO: add more turbines
-
-Kirby Heck
-2023 Aug. 23
+Kerry Klemmer
+2024 March 12
 """
 
 from typing import Optional 
@@ -13,15 +11,9 @@ from scipy.signal import convolve2d
 from scipy.interpolate import interpn
 from padeopsIO import key_search_r
 
-class CurledWake(): 
-    """
-    Martinez-Tossas, et al. (2021) implementation of the curled wake model. 
-    """
-
+class WakeTKE(): 
     def __init__(
             self, 
-            ct: float,
-            yaw: float = 0.0,
             d: float = 1,
             z_hub: float = 1, 
             xloc: float = 0,
@@ -31,35 +23,25 @@ class CurledWake():
             C: float = 4., 
             lam: float = 0.214, 
             kappa: float = 0.4, 
-            integrator: str = 'RK4', 
+            integrator: str = 'EF', 
             bkgd: Optional[object] = None, 
             delta_LES: Optional[object] = None,
             LES: bool = False,
-            LES_xCor: bool = True,
-            LES_sgs: bool = True,
-            LES_dpdx: bool = True,
-            LES_RS_div: bool = True,
-            model_turb: bool = True,
-            LES_RS_div_delta_delta: bool = False,
-            LES_RS_div_delta_base: bool = False,
-            LES_RS_div_base_delta: bool = False,
-            LES_base_grad: bool = True,
-            LES_delta_v_w: bool = True,
-            LES_delta_v: bool = True,
-            LES_delta_w: bool = True,
-            LES_base_v_w: bool=True,
-            smooth_LES: bool = False,
+            LES_prod: bool = True,
+            LES_sgs_trans: bool = True,
+            LES_pres_trans: bool = True,
+            LES_turb_trans: bool = True,
+            LES_diss: bool = True,
+            LES_buoy: bool = True,
+            LES_base_adv: bool = True,
+            LES_delta_vw: bool = True,
             avg_xy: bool = True, 
-            base_gradients: bool = False,
             dx: float = 0.05, 
             dy: float = 0.1, 
             dz: float = 0.1, 
     ): 
         """
         Args: 
-            ct (float): Rotor thrust, non-dimensionalized to
-                pi/8 d**2 rho u_h^2 cos(yaw)^2.
-            yaw (float): Rotor yaw angle (radians).
             d (float): non-dimensionalizing value for diameter. Defaults to 1.
             z_hub (float): non-dimensional hub height z_hub/d. Defaults to 1. 
             N (int): number of points to discretize Lamb-Oseem vortices. Defaults to 20. 
@@ -72,8 +54,6 @@ class CurledWake():
             avg_xy (bool): average background flow in x, y. Defaults to True. 
         """
 
-        self.ct = ct
-        self.yaw = yaw
         self.d = d  # TODO - be more consistent in the dimensional problem
         self.z_hub = z_hub
         self.xloc = xloc
@@ -88,22 +68,15 @@ class CurledWake():
         self.bkgd = bkgd  # TODO - fix this down the line
         self.delta_LES = delta_LES
         self.LES = LES
-        self.LES_xCor = LES_xCor
-        self.LES_sgs = LES_sgs
-        self.LES_dpdx = LES_dpdx
-        self.LES_RS_div = LES_RS_div
-        self.model_turb = model_turb
-        self.LES_RS_div_delta_delta = LES_RS_div_delta_delta
-        self.LES_RS_div_delta_base = LES_RS_div_delta_base
-        self.LES_RS_div_base_delta = LES_RS_div_base_delta
-        self.LES_base_grad = LES_base_grad
-        self.LES_delta_v_w = LES_delta_v_w
-        self.LES_base_v_w = LES_base_v_w
-        self.LES_delta_v = LES_delta_v
-        self.LES_delta_w = LES_delta_w
-        self.smooth_LES = smooth_LES
+        self.LES_prod = LES_prod
+        self.LES_sgs_trans = LES_sgs_trans
+        self.LES_pres_trans = LES_pres_trans
+        self.LES_turb_trans = LES_turb_trans
+        self.LES_diss = LES_diss
+        self.LES_buoy = LES_buoy
+        self.LES_base_adv = LES_base_adv
+        self.LES_delta_vw = LES_delta_vw
         self.avg_xy = avg_xy
-        self.base_gradients = base_gradients
         self.dx = dx
         self.dy = dy
         self.dz = dz
@@ -115,98 +88,68 @@ class CurledWake():
         self.init_grid()
         self.init_background()
         if delta_LES is not None:
-            self.init_delta_vw()
+            self.init_delta_uvw()
         if self.LES:
             self.init_delta_LES()
-        self.init_turbulence()
-
-    def deficit(
-            self, 
-            x: np.array, 
-            y: np.array, 
-            z: Optional[np.array] = 0, 
-            nu_eff: bool = None, 
-            field: str = 'u', 
-            non_dim: bool = True, 
-    ): 
-        """
-        Compute wake deficit at selected points. 
-        """
-        if not self.has_result or not self.within_bounds(x, y, z): 
-            self.compute_uvw(x, y, z, nu_eff=nu_eff)
         
-        x = np.atleast_1d(x)
-        y = np.atleast_1d(y)
-        z = np.atleast_1d(z)
-
-        points = (self.xg, self.yg, self.zg)
-        if x.ndim > 1 or y.ndim > 1 or z.ndim > 1:  
-            # if given ndarray, use those for the grid (assume tuples)
-            xG, yG, zG = x, y, z
-            if len(xG) == 1:  # TODO: Fix this
-                xG = np.ones_like(yG) * xG
-            if len(zG) == 1: 
-                zG = np.ones_like(yG) * zG
-        else: 
-            xG, yG, zG = np.meshgrid(x, y, z, indexing='ij')
-        shape = xG.shape
-        xl = np.ravel(xG)
-        yl = np.ravel(yG)
-        zl = np.ravel(zG)
-
-        query = np.stack([xl, yl, zl], axis=-1)
-
-        if field == 'u': 
-            u = interpn(points, self.u, query)
-            u = np.squeeze(np.reshape(u, shape))
-            if non_dim: 
-                u /= self.get_ud(weighting='hub')  # non-dimensionalize
-        else: 
-            raise NotImplementedError('deficit(): only Delta-u is implemented.')
-        return -u  # flip so to match with other deficit sign conventions  TODO
-        
-    def compute_uvw(
+    def compute_tke(
             self, 
             x: np.array, 
             y: np.array, 
             z: np.array, 
-            return_uvw: bool = False, 
-            nu_eff=None, 
+            prim: bool = False,
+            return_tke: bool = False, 
     )-> None: 
         """
-        Computes the wake deficit field via forward marching. 
+        Computes the wake deficit tke field via forward marching. 
         """        
         self.init_grid(x, y, z)  # creates a (possibly new) grid
-        self._interp_Ui()
-        self._interp_delta_ui()
-        if self.LES:
-            self._interp_delta_LES()
-            if self.smooth_LES:
-                self._smooth_LES()
-        if self.base_gradients:
-            self._interp_Ui_3D()
-        self.init_turbulence()
-        # TODO - reinitialize eddy viscosity, if needed ??
 
-        # initialize vortices
-        self._compute_vw()
-        # compute deficit field
-        self._compute_u() 
+        if not prim:
+            self._interp_Ui()
+            self._interp_delta_ui()
+            if self.LES:
+                self._interp_delta_LES()
+                # if self.smooth_LES:
+                #     self._smooth_LES()
+            elif self.base_gradients:
+                self._interp_Ui_3D()
+
+            self._compute_uvw()
+            # compute deficit field
+            self._compute_tke() 
+        else:
+            self._interp_prim_LES()
+
+            self._compute_prim_tke()
+
         self.has_result = True
 
-        if return_uvw: 
-            return (self.u, self.v, self.w)
+        if return_tke: 
+            return (self.tke)
 
     def init_grid(self, x=0, y=0, z=0, yz_buff: float = .6,): 
         """
         Creates a grid centered around the wind turbine. 
         """
+
         def _make_axis(xmin, xmax, dx): 
             """Helper function to create an axis from limits that always includes 0"""
             n_st = np.ceil(np.abs(xmin / dx)) * np.sign(xmin)
             n_end = np.ceil(np.abs(xmax / dx)) * np.sign(xmax)
             return np.arange(n_st, n_end + dx) * dx  # ensure that 0 is included in the grid
         
+        # if self.LES:
+
+        #     self.xg = self.delta_LES.xLine
+        #     self.yg = self.delta_LES.yLine
+        #     self.zg = self.delta_LES.zLine
+
+        #     self.dx = self.delta_LES.dx
+        #     self.dy = self.delta_LES.dy
+        #     self.dz = self.delta_LES.dz
+
+        # else:
         # set limits with buffers: 
         xlim = [np.min([-self.dx, np.min(x)]), np.max(x)]
         ylim = [np.min([-yz_buff, np.min(y)]), np.max([yz_buff, np.max(y)])]
@@ -253,7 +196,7 @@ class CurledWake():
 
             else: 
                 raise NotImplementedError('init_background(): Currently `avg_xy` must be True.')
-            if self.base_gradients:
+            if self.LES:
                 self._U_3D = self.bkgd.budget['ubar']/Ug
                 self._x = self.bkgd.xLine - self.xloc
                 self._y = self.bkgd.yLine - self.yloc
@@ -263,7 +206,7 @@ class CurledWake():
             self.V = 0 
             self.W = 0
 
-    def init_delta_vw(self):
+    def init_delta_uvw(self):
         """
         Initializes delta v and delta w from data
         """
@@ -272,6 +215,7 @@ class CurledWake():
             Ug = key_search_r(self.delta_LES.input_nml, 'g_geostrophic')
             # if self.avg_xy: 
             delta_ui = self.delta_LES.budget
+            self._delta_u = delta_ui['delta_u']/Ug
             self._delta_v = delta_ui['delta_v']/Ug
             self._delta_w = delta_ui['delta_w']/Ug
             self._delta_x = self.delta_LES.xLine
@@ -283,23 +227,43 @@ class CurledWake():
 
     def init_delta_LES(self):
         """
-        Initializes RHS of delta u transport from LES data
+        Initializes RHS of wake TKE transport from LES data
         """
-        self.delta_LES.read_budgets(budget_terms=['dpdx', 'xAdv_base_delta_fluc', 'xAD', 'delta_u',
-            'xAdv_delta_delta_fluc', 'xAdv_delta_base_fluc', 'xCor', 'xAdv_delta_base_mean', 'xSGS'])
         Ug = key_search_r(self.delta_LES.input_nml, 'g_geostrophic')
         Lref = self.delta_LES.Lref
         D = self.delta_LES.D
 
+        nonDim = Ug*Ug*Ug*Lref/D
+
         delta_budget = self.delta_LES.budget
-        self._dpdx = delta_budget['dpdx']/(Ug*Ug*Lref/D)
-        self._RS_div = (delta_budget['xAdv_base_delta_fluc'] + delta_budget['xAdv_delta_delta_fluc'] \
-                        + delta_budget['xAdv_delta_base_fluc'])/(Ug*Ug*Lref/D)
-        self._xCor = delta_budget['xCor']/(Ug*Ug*Lref/D)
-        self._base_grad = delta_budget['xAdv_delta_base_mean']/(Ug*Ug*Lref/D)
-        self._sgs = delta_budget['xSGS']/(Ug*Ug*Lref/D)
-        self._xAD = 0.5*delta_budget['xAD']/(Ug*Ug*Lref/D)
-        self._u_LES = delta_budget['delta_u']/Ug
+        self._tke_LES = delta_budget['TKE_wake']/(Ug*Ug)
+        self._pres_trans = delta_budget['TKE_p_transport_wake']/nonDim
+        self._sgs_trans = delta_budget['TKE_SGS_transport_wake']/nonDim
+        self._turb_trans = delta_budget['TKE_turb_transport_wake']/nonDim
+        self._prod = delta_budget['TKE_shear_production_wake']/nonDim
+        self._buoy = delta_budget['TKE_buoyancy_wake']/nonDim
+        self._diss = delta_budget['TKE_dissipation_wake']/nonDim
+        self._base_adv = delta_budget['TKE_adv_delta_base_k_wake']/nonDim
+
+    def init_prim_LES(self):
+        """
+        Initializes RHS of primary TKE transport from LES data
+        """
+        Ug = key_search_r(self.delta_LES.input_nml, 'g_geostrophic')
+        Lref = self.delta_LES.Lref
+        D = self.delta_LES.D
+
+        nonDim = Ug*Ug*Ug*Lref/D
+
+        prim_budget = self.prim_LES.budget
+        self._tke_LES = prim_budget['TKE']/(Ug*Ug)
+        self._pres_trans = prim_budget['TKE_p_transport']/nonDim
+        self._sgs_trans = prim_budget['TKE_SGS_transport']/nonDim
+        self._turb_trans = prim_budget['TKE_turb_transport']/nonDim
+        self._prod = prim_budget['TKE_shear_production']/nonDim
+        self._buoy = prim_budget['TKE_buoyancy']/nonDim
+        self._diss = prim_budget['TKE_dissipation']/nonDim
+        self._base_adv = prim_budget['TKE_adv_delta_base_k_wake']/nonDim
 
     def _interp_Ui(self)-> None: 
         """Interpolate velocity profiles to local grid"""
@@ -333,25 +297,28 @@ class CurledWake():
 
         interp_points = np.stack([xl, yl, zl], axis=-1)
 
-        self.dpdx = interpn((self._delta_x, self._delta_y, self._delta_z), self._dpdx, interp_points, 
+        self.tke_LES = interpn((self._delta_x, self._delta_y, self._delta_z), self._tke_LES, interp_points, 
                 bounds_error=False, fill_value=0).reshape((len(self.xg), len(self.yg), len(self.zg)))
 
-        self.RS_div = interpn((self._delta_x, self._delta_y, self._delta_z), self._RS_div, interp_points, 
+        self.pres_trans = interpn((self._delta_x, self._delta_y, self._delta_z), self._pres_trans, interp_points, 
                 bounds_error=False, fill_value=0).reshape((len(self.xg), len(self.yg), len(self.zg)))
 
-        self.xCor = interpn((self._delta_x, self._delta_y, self._delta_z), self._xCor, interp_points, 
+        self.sgs_trans = interpn((self._delta_x, self._delta_y, self._delta_z), self._sgs_trans, interp_points, 
                 bounds_error=False, fill_value=0).reshape((len(self.xg), len(self.yg), len(self.zg)))
 
-        self.base_grad = interpn((self._delta_x, self._delta_y, self._delta_z), self._base_grad, interp_points, 
+        self.turb_trans = interpn((self._delta_x, self._delta_y, self._delta_z), self._turb_trans, interp_points, 
                 bounds_error=False, fill_value=0).reshape((len(self.xg), len(self.yg), len(self.zg)))
 
-        self.sgs = interpn((self._delta_x, self._delta_y, self._delta_z), self._sgs, interp_points, 
+        self.prod = interpn((self._delta_x, self._delta_y, self._delta_z), self._prod, interp_points, 
                 bounds_error=False, fill_value=0).reshape((len(self.xg), len(self.yg), len(self.zg)))
 
-        self.xAD = interpn((self._delta_x, self._delta_y, self._delta_z), self._xAD, interp_points, 
+        self.buoy = interpn((self._delta_x, self._delta_y, self._delta_z), self._buoy, interp_points, 
                 bounds_error=False, fill_value=0).reshape((len(self.xg), len(self.yg), len(self.zg)))
 
-        self.u_LES = interpn((self._delta_x, self._delta_y, self._delta_z), self._u_LES, interp_points, 
+        self.diss = interpn((self._delta_x, self._delta_y, self._delta_z), self._diss, interp_points, 
+                bounds_error=False, fill_value=0).reshape((len(self.xg), len(self.yg), len(self.zg)))
+
+        self.base_adv = interpn((self._delta_x, self._delta_y, self._delta_z), self._base_adv, interp_points, 
                 bounds_error=False, fill_value=0).reshape((len(self.xg), len(self.yg), len(self.zg)))
 
     def _interp_delta_ui(self)-> None: 
@@ -363,49 +330,24 @@ class CurledWake():
             zl = np.ravel(zG)
 
             interp_points = np.stack([xl, yl, zl], axis=-1)
-
+            
+            self.delta_u = interpn((self._delta_x, self._delta_y, self._z), self._delta_u, interp_points, bounds_error=False, fill_value=0).reshape((len(self.xg), len(self.yg), len(self.zg))) 
             self.delta_v = interpn((self._delta_x, self._delta_y, self._z), self._delta_v, interp_points, bounds_error=False, fill_value=0).reshape((len(self.xg), len(self.yg), len(self.zg)))
             self.delta_w = interpn((self._delta_x, self._delta_y, self._z), self._delta_w, interp_points, bounds_error=False, fill_value=0).reshape((len(self.xg), len(self.yg), len(self.zg)))
 
     def _smooth_LES(self)-> None:
         """Smooth LES data"""
-        if self.smooth_LES:
-            for i in range(len(self.xg)):
-                self.u_LES[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.u_LES[i,...])
-                self.delta_v[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.delta_v[i,...])
-                self.delta_w[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.delta_w[i,...])
-                self.dpdx[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.dpdx[i,...])
-                self.RS_div[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.RS_div[i,...])
-                self.sgs[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.sgs[i,...])
-                self.xCor[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.xCor[i,...])
-                self.base_grad[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.base_grad[i,...])
+        # if self.smooth_LES:
+        #     for i in range(len(self.xg)):
+        #         self.u_LES[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.u_LES[i,...])
+        #         self.delta_v[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.delta_v[i,...])
+        #         self.delta_w[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.delta_w[i,...])
+        #         self.dpdx[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.dpdx[i,...])
+        #         self.RS_div[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.RS_div[i,...])
+        #         self.sgs[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.sgs[i,...])
+        #         self.xCor[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.xCor[i,...])
+        #         self.base_grad[i,...] = np.apply_along_axis(lambda m: self.moving_avg(m), axis=0, arr=self.base_grad[i,...])
 
-    def init_turbulence(self, nu_eff=None, model="default")-> None: 
-        """
-        Initializes eddy viscosity. 
-        """
-        if nu_eff is not None: 
-            self.nu_eff = nu_eff  # override turblence model
-            return
-        
-        if model == "default":
-            if self.bkgd is not None: 
-                self.lam = 15/126 #2.7e-4 * self.bkgd.Ro_f * self.d
-            
-            # compute mixing length and eddy viscosity
-            z = self.zg + self.z_hub  # in unphysical cases, could be below zero? 
-            self.lm = self.kappa * z / (1. + self.kappa * z / self.lam)
-            dUdz = np.gradient(self.U, self.dz, axis=-1)
-            self.nu_eff = self.C * self.lm**2 * abs(dUdz)
-        elif model == "rayleigh_fit":
-            zhub = np.argmin(self.zg)
-            Ub = self.U[zhub]
-            A = 0.5 * Ub * np.sqrt(1-self.ct)/2
-            sigma = 5.5
-            self.nu_eff = A * (0.01 + np.multiply(self.xg/(sigma**2), np.exp(-np.power(self.xg,2)/ (2*sigma ** 2))))
-        else: 
-            # TODO - FIX
-            raise NotImplementedError('Not a valid turbulence model. Please choose default or rayleigh_fit.')
 
     def get_ic(
             self, 
@@ -475,66 +417,41 @@ class CurledWake():
 
         return ud
 
-    def _compute_u(self, ud=None)-> None: 
+    def _compute_tke(self, ud=None)-> None: 
         """
         Forward marches Delta_u field. 
         """
-        def _dudt(x, _u): 
+        def _dkdt(x, _tke): 
             """du/dt function"""
             xid = np.argmin(np.abs(x - self.xg))
             # Full velocity fields for advection: 
-            u = _u + self.U
-            if self.LES_base_v_w:
-                v = self.V
-                w = self.W
-            else:
-                v = np.zeros(np.shape(self.V))
-                w = np.zeros(np.shape(self.W))
-
-            delta_v = np.zeros(np.shape(self.V))
-            delta_w = np.zeros(np.shape(self.W))
-            if self.yaw != 0 or self.LES_delta_v_w:
-                v = v + self.v[xid, ...]
-                w = w + self.w[xid, ...]  # TODO: HOTFIX
-                delta_v = self.v[xid, ...]
-                delta_w = self.w[xid, ...]
-            elif self.LES_delta_v:
-                v = v + self.v[xid, ...]
-                delta_v = self.v[xid, ...]
-            elif self.LES_delta_w:
-                w = w + self.w[xid, ...]
-                delta_w = self.w[xid, ...]
+            u = self.u[xid, ...] + self.U
+            v = self.v[xid, ...] + self.V
+            w = self.w[xid, ...] + self.W 
             # gradient fields: 
-            dudy = np.gradient(_u, self.dy, axis=0)
-            dudz = np.gradient(_u, self.dz, axis=1)
-            d2udy2 = np.gradient(dudy, self.dy, axis=0)
-            d2udz2 = np.gradient(dudz, self.dz, axis=1)
+            dkdy = np.gradient(_tke, self.dy, axis=0)
+            dkdz = np.gradient(_tke, self.dz, axis=1)
+            d2kdy2 = np.gradient(dkdy, self.dy, axis=0)
+            d2kdz2 = np.gradient(dkdz, self.dz, axis=1)
             # base gradient fields:   
             rhs_value = 0         
             if self.LES:
-                if self.LES_xCor:
-                    rhs_value += self.xCor[xid,...]
-                if self.LES_sgs:
-                    rhs_value += self.sgs[xid,...]
-                if self.LES_RS_div:
-                    rhs_value += self.RS_div[xid,...]
-                elif self.model_turb:
-                    rhs_value += self.nu_eff * (d2udy2 + d2udz2)
-                if self.LES_dpdx:
-                    rhs_value += self.dpdx[xid,...]
-                if self.LES_base_grad:
-                    rhs_value += self.base_grad[xid,...]
-                elif self.base_gradients:
-                    [dUdy, dUdz] = np.gradient(self.U_3D[xid,...], self.dy, self.dz)
-                    dUdy = np.mean(dUdy, 0)
-                    dUdz = np.mean(dUdz, 0)
-                    rhs_value += - np.multiply(delta_v, dUdy) - np.multiply(delta_w,dUdz)
-                return (-v * dudy - w * dudz + rhs_value) / u
-            elif self.base_gradients:
-                [dUdy, dUdz] = np.gradient(self.U_3D[xid,...], self.dy, self.dz)
-                rhs_value += - np.multiply(delta_v, dUdy) - np.multiply(delta_w,dUdz)
-
-            return (-v * dudy - w * dudz  + self.nu_eff * (d2udy2 + d2udz2) + rhs_value) / u
+                if self.LES_pres_trans:
+                    rhs_value += self.pres_trans[xid,...]
+                if self.LES_sgs_trans:
+                    rhs_value += self.sgs_trans[xid,...]
+                if self.LES_turb_trans:
+                    rhs_value += self.turb_trans[xid,...]
+                if self.LES_prod:
+                    rhs_value += self.prod[xid,...]
+                if self.LES_buoy:
+                    rhs_value += self.buoy[xid,...]
+                if self.LES_diss:
+                    rhs_value += self.diss[xid,...]
+                if self.LES_base_adv:
+                    rhs_value += self.base_adv[xid,...]
+        
+            return (-v * dkdy - w * dkdz + rhs_value) / u
             
         # now integrate! 
         if ud is None:
@@ -544,7 +461,7 @@ class CurledWake():
             # xval = np.argmin(abs(self.xg))
             # ic = self.xAD[xval,...]
             xval = np.argmin(abs(self.xg-5))
-            ic = self.u_LES[xval,...]
+            ic = self.tke_LES[xval,...]
             xmin = 5
             self.ic = ic
         else:
@@ -552,28 +469,24 @@ class CurledWake():
             xmin = 0 
         # xmin = 0
         xmax = max(self.xg)
-        x, delta_u = integrate(ic, _dudt, dt=self.dx, T=[xmin, xmax], f=self.integrator)
+        x, tke = integrate(ic, _dkdt, dt=self.dx, T=[xmin, xmax], f=self.integrator)
 
-        self.u = np.zeros(self.shape)
+        self.tke = np.zeros(self.shape)
         xid_st = np.argmin(abs(self.xg-xmin))
-        self.u[xid_st:, ...] = delta_u
+        self.tke[xid_st:, ...] = tke
 
-    def _compute_vw(self)-> None: 
+    def _compute_uvw(self)-> None: 
         """
         Use Lamb-Oseen vortices to compute curling
         """
-        self.v = np.zeros(self.shape)
-        self.w = np.zeros(self.shape)
-        if self.LES_delta_v_w:
+
+        self.u = self.delta_u
+
+        if self.LES and self.LES_delta_vw:
             self.v = self.delta_v
             self.w = self.delta_w
             return
-        elif self.LES_delta_v:
-            self.v = self.delta_v
-        elif self.LES_delta_w:
-            self.w = self.delta_w
-        return # This only accounts for yaw=0 case
-        if self.yaw == 0: 
+        else: 
             self.v = np.zeros(self.shape)
             self.w = np.zeros(self.shape)
             return
@@ -835,3 +748,4 @@ def get_xids(x=None, y=None, z=None,
         return ret[0]  # don't return a length one tuple 
     else: 
         return ret
+
