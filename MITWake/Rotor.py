@@ -87,8 +87,8 @@ def _yawthrust_residual(
     a, u4, v4 = x
     e_a = (
         1
-        - np.sqrt(Uamb**2 - u4**2 - v4**2)
-        / (np.sqrt(Ctprime) * Uamb * np.cos(yaw))
+        - np.sqrt((Uamb**2 - u4**2 - v4**2) / Ctprime)
+        / (Uamb * np.cos(yaw))
         - a
     )
 
@@ -193,6 +193,16 @@ def yawthrust(
         eps=eps,
     )
     return a, u4, v4
+
+
+def model_Cp(
+        Ctprime: float, yaw: float, eps=0.000001, 
+) -> float: 
+    """
+    Computes C_p = (1 - an(yaw))^3 * C_T' * cos^3(yaw)
+    """
+    a, u4, v4 = yawthrust(Ctprime, yaw, eps=eps)
+    return (1 - a)**3 * Ctprime * np.cos(yaw)**3 
 
 
 def yawthrust_ddCt(
